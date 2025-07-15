@@ -40,46 +40,66 @@ def load_data():
     ]
     # Baca semua kolom sebagai string agar cleaning harga aman
     df = pd.read_csv("amazon.csv", usecols=columns, dtype=str, low_memory=False)
+    # --- OPTIMIZATION: Sample immediately after loading ---
+    max_rows = 20000  # Lower sample size for memory efficiency
+    sampled = False
+    if len(df) > max_rows:
+        df = df.sample(max_rows, random_state=42)
+        sampled = True
     kurs_inr_to_idr = 190
     # Cleaning harga sebelum konversi ke float
     for col in ["discounted_price", "actual_price"]:
         if col in df.columns:
             df[col] = clean_price_column(df[col]) * kurs_inr_to_idr
+            df[col] = (
+                pd.to_numeric(df[col], errors="coerce").fillna(0).astype("float32")
+            )
     if "discount_percentage" in df.columns:
-        df["discount_percentage"] = pd.to_numeric(
-            df["discount_percentage"]
-            .astype(str)
-            .str.replace("%", "")
-            .str.replace(r"[^\d.]", "", regex=True),
-            errors="coerce",
-        ).fillna(0)
+        df["discount_percentage"] = (
+            pd.to_numeric(
+                df["discount_percentage"]
+                .astype(str)
+                .str.replace("%", "")
+                .str.replace(r"[^\d.]", "", regex=True),
+                errors="coerce",
+            )
+            .fillna(0)
+            .astype("float32")
+        )
     for col in ["rating", "rating_count"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    max_rows = 100000
-    sampled = False
-    if len(df) > max_rows:
-        df = df.sample(max_rows, random_state=42)
-        sampled = True
+            df[col] = (
+                pd.to_numeric(df[col], errors="coerce").fillna(0).astype("float32")
+            )
+    # --- OPTIMIZATION: Convert categorical columns to category dtype ---
+    for col in ["category", "user_id", "user_name", "review_id", "product_id"]:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
     return df, sampled
 
 
 @st.cache_data(show_spinner=False)
 def prepare_data(df):
-    df_prep = df.copy()
+    df_prep = df.copy(deep=False)  # Avoid deep copy for memory efficiency
     # Handle missing value: numerik -> median, kategori -> 'Unknown', teks -> ''
-    for col in df_prep.select_dtypes(include=["float", "int"]):
+    for col in df_prep.select_dtypes(include=["float", "int", "float32", "int32"]):
         df_prep[col] = df_prep[col].fillna(df_prep[col].median())
     for col in df_prep.select_dtypes(include=["object"]):
         df_prep[col] = df_prep[col].fillna("")
     # Feature engineering: panjang review, jumlah kata review, diskon_rupiah
     if "review_content" in df_prep.columns:
-        df_prep["panjang_review"] = df_prep["review_content"].astype(str).str.len()
+        df_prep["panjang_review"] = (
+            df_prep["review_content"].astype(str).str.len().astype("int32")
+        )
         df_prep["jumlah_kata_review"] = (
-            df_prep["review_content"].astype(str).str.split().apply(len)
+            df_prep["review_content"].astype(str).str.split().apply(len).astype("int32")
         )
     if "discounted_price" in df_prep.columns and "actual_price" in df_prep.columns:
-        df_prep["diskon_rupiah"] = df_prep["actual_price"] - df_prep["discounted_price"]
+        df_prep["diskon_rupiah"] = (
+            df_prep["actual_price"] - df_prep["discounted_price"]
+        ).astype("float32")
+    # --- OPTIMIZATION: Drop unused columns if any ---
+    # Example: df_prep = df_prep.drop(["img_link", "product_link"], axis=1, errors="ignore")
     return df_prep
 
 
@@ -179,7 +199,7 @@ with tab1:
         .rename(columns={0: "Missing Value", "index": "Kolom"})
     )
     # Statistik numerik
-    num_df = df.select_dtypes(include=["float", "int"])
+    num_df = df.select_dtypes(include=["float", "int", "float32", "int32"])
     if not num_df.empty:
         st.write("**Statistik Ringkasan Numerik**")
         st.dataframe(num_df.describe().T)
@@ -188,9 +208,12 @@ with tab1:
     if not cat_df.empty:
         st.write("**Statistik Ringkasan Kategorikal/Teks**")
         st.dataframe(cat_df.describe().T)
-    # Visualisasi penting
-    if "category" in df.columns:
-        top_cat = df["category"].value_counts().nlargest(10).reset_index()
+    # Visualisasi penting (use sampled data for plots)
+    plot_sample = (
+        df.sample(min(2000, len(df)), random_state=42) if len(df) > 2000 else df
+    )
+    if "category" in plot_sample.columns:
+        top_cat = plot_sample["category"].value_counts().nlargest(10).reset_index()
         top_cat.columns = ["Kategori", "Jumlah"]
         fig_cat = px.bar(
             top_cat, x="Kategori", y="Jumlah", title="Top 10 Kategori Produk"
@@ -199,9 +222,9 @@ with tab1:
         st.caption(
             f"Kategori terpopuler: {top_cat['Kategori'][0]} ({top_cat['Jumlah'][0]} produk)"
         )
-    if "discounted_price" in df.columns:
+    if "discounted_price" in plot_sample.columns:
         fig_harga = px.histogram(
-            df, x="discounted_price", nbins=30, title="Distribusi Harga Diskon"
+            plot_sample, x="discounted_price", nbins=30, title="Distribusi Harga Diskon"
         )
         fig_harga.update_layout(
             xaxis_title="Harga Diskon (Rp)",
@@ -211,20 +234,22 @@ with tab1:
         fig_harga.update_traces(hovertemplate="Rp %{x:,.0f}<extra></extra>")
         st.plotly_chart(fig_harga, use_container_width=True)
         st.caption(
-            f"Harga diskon rata-rata: {format_rupiah(df['discounted_price'].mean())}"
+            f"Harga diskon rata-rata: {format_rupiah(plot_sample['discounted_price'].mean())}"
         )
-    if "actual_price" in df.columns:
-        st.caption(f"Harga asli rata-rata: {format_rupiah(df['actual_price'].mean())}")
-    if "rating" in df.columns:
+    if "actual_price" in plot_sample.columns:
+        st.caption(
+            f"Harga asli rata-rata: {format_rupiah(plot_sample['actual_price'].mean())}"
+        )
+    if "rating" in plot_sample.columns:
         fig_rating = px.histogram(
-            df, x="rating", nbins=20, title="Distribusi Rating Produk"
+            plot_sample, x="rating", nbins=20, title="Distribusi Rating Produk"
         )
         fig_rating.update_layout(xaxis_title="Rating", yaxis_title="Jumlah")
         st.plotly_chart(fig_rating, use_container_width=True)
-        st.caption(f"Rata-rata rating produk: {df['rating'].mean():.2f}")
-    if "discounted_price" in df.columns and "rating" in df.columns:
+        st.caption(f"Rata-rata rating produk: {plot_sample['rating'].mean():.2f}")
+    if "discounted_price" in plot_sample.columns and "rating" in plot_sample.columns:
         fig_scatter = px.scatter(
-            df,
+            plot_sample,
             x="discounted_price",
             y="rating",
             title="Harga Diskon vs Rating",
@@ -238,12 +263,12 @@ with tab1:
         fig_scatter.update_traces(hovertemplate="Harga: Rp %{x:,.0f}<br>Rating: %{y}")
         st.plotly_chart(fig_scatter, use_container_width=True)
         st.caption("Visualisasi hubungan harga diskon dan rating produk.")
-    if "review_content" in df.columns:
+    if "review_content" in plot_sample.columns:
         import matplotlib.pyplot as plt
         from wordcloud import WordCloud
 
         try:
-            text = " ".join(df["review_content"].dropna().astype(str))
+            text = " ".join(plot_sample["review_content"].dropna().astype(str))
             wordcloud = WordCloud(
                 width=800, height=400, background_color="white"
             ).generate(text)
@@ -255,9 +280,12 @@ with tab1:
         except Exception:
             pass
     # Tabel Top 5 produk diskon tertinggi
-    if "discounted_price" in df.columns and "product_name" in df.columns:
+    if (
+        "discounted_price" in plot_sample.columns
+        and "product_name" in plot_sample.columns
+    ):
         st.write("**Top 5 Produk dengan Diskon Tertinggi**")
-        top5_diskon = df.copy()
+        top5_diskon = plot_sample.copy()
         if "actual_price" in top5_diskon.columns:
             top5_diskon["diskon_rupiah"] = top5_diskon["actual_price"].astype(
                 float
@@ -282,9 +310,9 @@ with tab1:
                 use_container_width=True,
             )
     # Tabel Top 5 produk rating tertinggi
-    if "rating" in df.columns and "product_name" in df.columns:
+    if "rating" in plot_sample.columns and "product_name" in plot_sample.columns:
         st.write("**Top 5 Produk dengan Rating Tertinggi**")
-        top5_rating = df.sort_values("rating", ascending=False).head(5)
+        top5_rating = plot_sample.sort_values("rating", ascending=False).head(5)
         top5_rating_show = top5_rating[
             ["product_name", "rating", "discounted_price"]
         ].copy()
@@ -339,7 +367,10 @@ with tab3:
     if not num_cols:
         st.warning("Tidak ada kolom numerik yang bisa digunakan untuk clustering.")
     else:
+        # --- OPTIMIZATION: Use sampled data for clustering ---
         df_cl = pd.get_dummies(df_prep[use_cols], drop_first=True).fillna(0)
+        if len(df_cl) > 2000:
+            df_cl = df_cl.sample(2000, random_state=42)
         pca2 = get_pca_scaled(df_cl, n_components=2)
         # DBSCAN
         model_db = DBSCAN(eps=1.0, min_samples=5).fit(pca2)
@@ -381,6 +412,10 @@ with tab3:
         feature_cols_no_target = [c for c in num_cols if c != target_col]
         X = df_prep[feature_cols_no_target]
         y = df_prep[target_col]
+        # --- OPTIMIZATION: Use sampled data for regression ---
+        if len(X) > 2000:
+            X = X.sample(2000, random_state=42)
+            y = y.loc[X.index]
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
